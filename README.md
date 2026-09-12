@@ -162,8 +162,8 @@ This allows the modeling pipeline to be developed and demonstrated end-to-end wi
 
 2. **Clone the repository**
    ```bash
-   git clone https://github.com/<org-or-user>/sih26184-cashtrace.git
-   cd sih26184-cashtrace
+   git clone https://github.com/riyagoyal08010-glitch/CashTrace.git
+   cd CashTrace
    code .
    ```
    The last command opens the project directly in VS Code.
