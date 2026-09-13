@@ -179,8 +179,8 @@ This allows the modeling pipeline to be developed and demonstrated end-to-end wi
 
 4. **Set up the Python environment** (for `data-pipeline/` and `ml-models/`)
    ```bash
-   python -m venv .venv
-   source .venv/bin/activate      # on Windows: .venv\Scripts\activate
+   python -m venv venv
+   venv\Scripts\activate      
    pip install -r requirements.txt
    ```
    In VS Code, select this interpreter via `Ctrl+Shift+P` → `Python: Select Interpreter` → `.venv`.
