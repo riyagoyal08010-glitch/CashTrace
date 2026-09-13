@@ -17,6 +17,7 @@ SQLAlchemy==2.0.31
 GeoAlchemy2==0.15.1
 psycopg2-binary==2.9.9
 python-dotenv==1.0.1
+Faker==40.38.0
 
 # ---- Dev tools ----
 pytest==8.2.2
