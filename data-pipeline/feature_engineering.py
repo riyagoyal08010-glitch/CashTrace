@@ -1,55 +1,95 @@
 """
-CashTrace — Feature Engineering
-================================
-Builds features across four categories for fraud/cashout prediction:
-  1. Fund flow features    (per-account transaction graph stats)
-  2. Temporal features     (timing patterns)
-  3. Geospatial features   (withdrawal location patterns)
-  4. Prediction targets    (labels for modeling)
+CashTrace — Feature Engineering (reconciled, leakage-safe)
+=============================================================
+This reconciles two independently-built feature engineering scripts:
 
-Input : data/accounts.csv, data/transactions.csv, data/withdrawal_events.csv,
-        data/complaints.csv, data/locations.csv
-Output: features/account_features.csv, features/complaint_features.csv
-        features/complaint_features_inference_clean.csv
-        features/complaint_ground_truth_targets.csv
+  - graph_builder.py / the original feature_engineering.py (this repo):
+    correct point-in-time graph snapshots via graph_as_of(), but a
+    narrower feature set (basic graph + temporal features only).
 
-NOTE on leakage: the victim_* fund-flow columns in complaint_features are
-aggregated over ALL transactions regardless of filed_timestamp, so they are
-NOT safe as ML-1 model input (see fix below, and see
-split_and_leakage_check.py for the point-in-time replacement).
+  - A teammate's feature_engineering.py: richer features (fund-flow
+    stats, temporal burstiness, geospatial spread, hop distance) and a
+    good defensive merge-collision guard — but its fund-flow/temporal/
+    geospatial aggregations run over ALL transactions/withdrawals
+    regardless of filed_timestamp, which the script's own docstrings
+    flag as unsafe for per-complaint model input.
+
+The fix is structural, not a patch: the aggregation functions themselves
+(build_fund_flow_features, build_temporal_features, build_geospatial_features)
+are generic — they compute stats over whatever transactions/withdrawals
+DataFrame they're given. The leak was entirely in HOW they were called
+(the full table, unfiltered). Calling them with a cutoff-filtered slice
+per complaint makes them leakage-safe with no change to their internals.
+
+Output:
+  features/account_features_full_history.csv   - descriptive only, NEVER use as ML input
+  features/complaint_features_pointintime.csv   - leakage-safe, ML-ready
+  features/complaint_ground_truth_targets.csv   - labels / post-event outcomes only
 """
 
-import pandas as pd
-import numpy as np
-import networkx as nx
 from pathlib import Path
 
-DATA_DIR = Path("data")
+import networkx as nx
+import numpy as np
+import pandas as pd
+
+from graph_builder import (
+    build_transaction_graph,
+    get_reachable_accounts,
+    graph_as_of,
+    load_data as load_raw_data,
+)
+
+DATA_DIR = "./data"
 OUT_DIR = Path("features")
 OUT_DIR.mkdir(exist_ok=True)
 
 
-def load_data():
-    accounts = pd.read_csv(DATA_DIR / "accounts.csv", parse_dates=["opened_date"])
-    transactions = pd.read_csv(DATA_DIR / "transactions.csv", parse_dates=["timestamp"])
-    withdrawals = pd.read_csv(DATA_DIR / "withdrawal_events.csv", parse_dates=["timestamp"])
-    complaints = pd.read_csv(
-        DATA_DIR / "complaints.csv",
-        parse_dates=["first_transaction_timestamp", "filed_timestamp"],
+def assert_no_suffix_collision(df: pd.DataFrame, expected_cols: list, context: str) -> None:
+    """
+    Guards against pandas silently renaming colliding merge columns to
+    `<col>_x` / `<col>_y` instead of erroring — which turns into a
+    KeyError several scripts downstream instead of a clear message at
+    the merge site. Call right after any merge where `expected_cols`
+    must survive as single, unsuffixed columns.
+    """
+    missing = [c for c in expected_cols if c not in df.columns]
+    if not missing:
+        return
+    suffixed_hints = {
+        c: [sc for sc in (f"{c}_x", f"{c}_y") if sc in df.columns]
+        for c in missing
+    }
+    details = "; ".join(
+        f"'{c}' missing" + (f" (found suffixed as {hints} -- likely a duplicate-column "
+                             f"merge collision)" if hints else "")
+        for c, hints in suffixed_hints.items()
     )
-    locations = pd.read_csv(DATA_DIR / "locations.csv")
-    return accounts, transactions, withdrawals, complaints, locations
+    raise AssertionError(f"[{context}] {details}")
+
+
+def load_data():
+    data = load_raw_data(DATA_DIR)
+    return (data["accounts"], data["transactions"], data["withdrawal_events"],
+            data["complaints"], data["locations"])
 
 
 # ---------------------------------------------------------------------------
-# 1. FUND FLOW FEATURES
+# GENERIC AGGREGATIONS — leakage-safe ONLY if the caller scopes the input.
+# These are otherwise unchanged from the richer teammate version.
 # ---------------------------------------------------------------------------
+
 def build_fund_flow_features(accounts: pd.DataFrame, transactions: pd.DataFrame) -> pd.DataFrame:
-    """Per-account money-movement features, including graph-based hop distance.
-    NOTE: this aggregates over ALL transactions (not point-in-time) -- fine for
-    the standalone account_features.csv table, but NOT safe to use directly as
-    ML-1 input per-complaint. See point_in_time_fund_flow() in
-    split_and_leakage_check.py for the leakage-safe version."""
+    """Per-account money-movement features. Caller MUST pass only
+    transactions known as of the relevant cutoff time to keep this
+    leakage-safe — this function itself has no notion of time."""
+    if len(transactions) == 0:
+        flow = accounts[["account_id", "is_mule", "is_victim"]].copy()
+        for col in ["total_out", "n_out", "mean_out", "max_out", "total_in", "n_in",
+                    "mean_in", "max_in", "net_flow", "total_txn_count",
+                    "passthrough_ratio", "in_degree", "out_degree", "degree_ratio"]:
+            flow[col] = 0
+        return flow
 
     out_agg = transactions.groupby("from_account")["amount"].agg(
         total_out="sum", n_out="count", mean_out="mean", max_out="max"
@@ -76,28 +116,26 @@ def build_fund_flow_features(accounts: pd.DataFrame, transactions: pd.DataFrame)
         flow["in_degree"] > 0, flow["out_degree"] / flow["in_degree"], 0
     )
 
-    flow = flow.reset_index()
-    return flow
+    return flow.reset_index()
 
 
-def hops_to_cashout(transactions: pd.DataFrame, victim_account: str, cashout_account: str) -> int:
-    """Shortest number of transaction hops from victim account to cashout account."""
-    G = nx.from_pandas_edgelist(
-        transactions, "from_account", "to_account", create_using=nx.DiGraph
-    )
-    try:
-        return nx.shortest_path_length(G, source=victim_account, target=cashout_account)
-    except (nx.NetworkXNoPath, nx.NodeNotFound):
-        return -1
+def build_temporal_features(accounts: pd.DataFrame, transactions: pd.DataFrame,
+                             now_ref=None) -> pd.DataFrame:
+    """Timing-pattern features per account. `now_ref` defaults to the max
+    timestamp in the passed-in transactions — for point-in-time use, pass
+    the complaint's cutoff explicitly so 'hours_since_last_txn' means
+    'as of when the complaint was filed', not 'as of the end of the
+    dataset'."""
+    if len(transactions) == 0:
+        return accounts[["account_id"]].assign(
+            account_age_days=np.nan, out_active_span_hours=np.nan,
+            out_hours_since_last_txn=np.nan, out_n=0,
+            in_active_span_hours=np.nan, in_hours_since_last_txn=np.nan,
+            in_n=0, out_txn_burstiness=np.nan,
+        )
 
-
-# ---------------------------------------------------------------------------
-# 2. TEMPORAL FEATURES
-# ---------------------------------------------------------------------------
-def build_temporal_features(accounts: pd.DataFrame, transactions: pd.DataFrame) -> pd.DataFrame:
-    """Timing-pattern features per account: activity spread, burstiness, recency."""
-
-    now_ref = transactions["timestamp"].max()
+    if now_ref is None:
+        now_ref = transactions["timestamp"].max()
 
     def per_account_time_stats(df, acct_col):
         g = df.groupby(acct_col)["timestamp"]
@@ -124,44 +162,9 @@ def build_temporal_features(accounts: pd.DataFrame, transactions: pd.DataFrame) 
         return pd.Series(result, name="out_txn_burstiness")
 
     temporal = temporal.join(burstiness(transactions, "from_account"))
-    temporal = temporal.reset_index()
-    return temporal
+    return temporal.reset_index()
 
 
-def build_complaint_timing_features(complaints: pd.DataFrame, withdrawals: pd.DataFrame) -> pd.DataFrame:
-    """Reproduces + extends the hours_to_withdrawal analysis from the EDA, per complaint."""
-    c = complaints.copy()
-    c = c.merge(
-        withdrawals[["event_id", "timestamp"]],
-        left_on="true_withdrawal_event",
-        right_on="event_id",
-        how="left",
-    ).rename(columns={"timestamp": "withdrawal_timestamp"})
-
-    c["hours_first_txn_to_filed"] = (
-        c["filed_timestamp"] - c["first_transaction_timestamp"]
-    ).dt.total_seconds() / 3600
-    c["hours_to_withdrawal"] = (
-        c["withdrawal_timestamp"] - c["filed_timestamp"]
-    ).dt.total_seconds() / 3600
-    c["filed_hour_of_day"] = c["filed_timestamp"].dt.hour
-    c["filed_day_of_week"] = c["filed_timestamp"].dt.dayofweek
-
-    return c[
-        [
-            "complaint_id",
-            "is_predictive_case",
-            "hours_first_txn_to_filed",
-            "hours_to_withdrawal",
-            "filed_hour_of_day",
-            "filed_day_of_week",
-        ]
-    ]
-
-
-# ---------------------------------------------------------------------------
-# 3. GEOSPATIAL FEATURES
-# ---------------------------------------------------------------------------
 def haversine(lat1, lon1, lat2, lon2):
     """Great-circle distance in km between two lat/lon points (vectorized)."""
     R = 6371.0
@@ -172,186 +175,249 @@ def haversine(lat1, lon1, lat2, lon2):
 
 
 def build_geospatial_features(withdrawals: pd.DataFrame, locations: pd.DataFrame) -> pd.DataFrame:
-    """Per-account withdrawal-location features: spread, diversity, home-base distance."""
+    """Per-account withdrawal-location features: spread, diversity,
+    home-base distance. Caller MUST pass only withdrawals known as of the
+    cutoff — for a complaint's victim account, this describes the
+    victim's own PAST (legitimate) withdrawal behavior, which is safe;
+    it never includes the fraud cash-out itself since that hasn't
+    happened yet at filing time for predictive cases."""
+    if len(withdrawals) == 0:
+        return pd.DataFrame(columns=[
+            "account_id", "n_withdrawals", "n_unique_locations",
+            "n_unique_cities", "avg_dist_from_home_km",
+            "max_dist_from_home_km", "n_atm_type",
+        ])
 
     w = withdrawals.merge(locations, on="location_id", how="left")
 
     def per_account_geo(g):
         home_lat, home_lon = g["latitude"].mean(), g["longitude"].mean()
         dists = haversine(g["latitude"], g["longitude"], home_lat, home_lon)
-        return pd.Series(
-            {
-                "n_withdrawals": len(g),
-                "n_unique_locations": g["location_id"].nunique(),
-                "n_unique_cities": g["city"].nunique(),
-                "avg_dist_from_home_km": dists.mean(),
-                "max_dist_from_home_km": dists.max(),
-                "n_atm_type": (g["type"] == "ATM").sum(),
-            }
-        )
+        return pd.Series({
+            "n_withdrawals": len(g),
+            "n_unique_locations": g["location_id"].nunique(),
+            "n_unique_cities": g["city"].nunique(),
+            "avg_dist_from_home_km": dists.mean(),
+            "max_dist_from_home_km": dists.max(),
+            "n_atm_type": (g["type"] == "ATM").sum(),
+        })
 
-    geo = w.groupby("account_id").apply(per_account_geo).reset_index()
+    geo = w.groupby("account_id").apply(per_account_geo, include_groups=False).reset_index()
     return geo
 
 
-def cashout_distance_from_victim(
-    complaints: pd.DataFrame, accounts: pd.DataFrame, withdrawals: pd.DataFrame, locations: pd.DataFrame
-) -> pd.DataFrame:
-    """Distance between where the cashout happened and where the victim account 'normally' operates."""
+# ---------------------------------------------------------------------------
+# POINT-IN-TIME WRAPPER — this is the actual leakage fix.
+# ---------------------------------------------------------------------------
+
+def point_in_time_features_for_complaint(complaint_row, accounts_indexed, txn_by_from,
+                                          txn_by_to, wd_by_account, graph, max_hops=6):
+    """
+    Builds every feature for one complaint using ONLY data known as of
+    complaint_row['filed_timestamp']. Computes the victim's own stats
+    directly (not via the generic multi-account aggregation functions
+    above, which are correct but O(all accounts) per call — calling
+    those once per complaint does needless repeated work; this does the
+    equivalent computation scoped to just the one account that matters
+    for this complaint).
+
+    accounts_indexed, txn_by_from, txn_by_to, wd_by_account are
+    pre-grouped lookups — see build_complaint_feature_matrix for setup.
+    """
+    cutoff = complaint_row["filed_timestamp"]
+    victim = complaint_row["victim_account"]
+    first_txn = complaint_row["first_transaction_timestamp"]
+
+    subgraph = graph_as_of(graph, cutoff)
+    candidates = get_reachable_accounts(subgraph, victim, max_hops=max_hops)
+
+    out_txn = txn_by_from.get(victim)
+    out_txn = out_txn[out_txn["timestamp"] <= cutoff] if out_txn is not None else None
+    in_txn = txn_by_to.get(victim)
+    in_txn = in_txn[in_txn["timestamp"] <= cutoff] if in_txn is not None else None
+
+    total_out = out_txn["amount"].sum() if out_txn is not None and len(out_txn) else 0.0
+    n_out = len(out_txn) if out_txn is not None else 0
+    total_in = in_txn["amount"].sum() if in_txn is not None and len(in_txn) else 0.0
+    n_in = len(in_txn) if in_txn is not None else 0
+    passthrough_ratio = (total_out / total_in) if total_in > 0 else 0.0
+
+    burstiness = np.nan
+    if out_txn is not None and len(out_txn) >= 3:
+        gaps = out_txn.sort_values("timestamp")["timestamp"].diff().dt.total_seconds().dropna()
+        if gaps.mean() > 0:
+            burstiness = gaps.std() / gaps.mean()
+
+    all_txn_times = []
+    if out_txn is not None and len(out_txn):
+        all_txn_times.append(out_txn["timestamp"])
+    if in_txn is not None and len(in_txn):
+        all_txn_times.append(in_txn["timestamp"])
+    if all_txn_times:
+        combined = pd.concat(all_txn_times)
+        active_span_hours = (combined.max() - combined.min()).total_seconds() / 3600
+        hours_since_last_txn = (cutoff - combined.max()).total_seconds() / 3600
+    else:
+        active_span_hours, hours_since_last_txn = 0.0, np.nan
+
+    opened_date = accounts_indexed.at[victim, "opened_date"] if victim in accounts_indexed.index else pd.NaT
+    account_age_days = (cutoff - opened_date).total_seconds() / 86400 if pd.notna(opened_date) else np.nan
+
+    wd = wd_by_account.get(victim)
+    wd = wd[wd["timestamp"] <= cutoff] if wd is not None else None
+    if wd is not None and len(wd):
+        n_withdrawals = len(wd)
+        n_unique_locations = wd["location_id"].nunique()
+        n_unique_cities = wd["city"].nunique()
+        home_lat, home_lon = wd["latitude"].mean(), wd["longitude"].mean()
+        dists = haversine(wd["latitude"], wd["longitude"], home_lat, home_lon)
+        avg_dist_from_home_km = dists.mean()
+    else:
+        n_withdrawals, n_unique_locations, n_unique_cities, avg_dist_from_home_km = 0, 0, 0, np.nan
+
+    reporting_delay_hours = (cutoff - first_txn).total_seconds() / 3600.0
+
+    return {
+        "complaint_id": complaint_row["complaint_id"],
+        "reported_amount": complaint_row["reported_amount"],
+        "log_reported_amount": float(np.log1p(complaint_row["reported_amount"])),
+        "hour_of_day": first_txn.hour,
+        "day_of_week": first_txn.dayofweek,
+        "is_weekend": int(first_txn.dayofweek >= 5),
+        "reporting_delay_hours": reporting_delay_hours,
+        "num_candidate_accounts": len(candidates),
+        "state": complaint_row["state"],
+        "victim_flow_total_out": total_out,
+        "victim_flow_n_out": n_out,
+        "victim_flow_total_in": total_in,
+        "victim_flow_n_in": n_in,
+        "victim_flow_passthrough_ratio": passthrough_ratio,
+        "victim_temporal_account_age_days": account_age_days,
+        "victim_temporal_active_span_hours": active_span_hours,
+        "victim_temporal_hours_since_last_txn": hours_since_last_txn,
+        "victim_temporal_out_txn_burstiness": burstiness,
+        "victim_geo_n_withdrawals": n_withdrawals,
+        "victim_geo_n_unique_locations": n_unique_locations,
+        "victim_geo_n_unique_cities": n_unique_cities,
+        "victim_geo_avg_dist_from_home_km": avg_dist_from_home_km,
+    }
+
+
+def build_complaint_feature_matrix(complaints_df, accounts, transactions,
+                                    withdrawals, locations, graph, max_hops=6):
+    """Pre-groups lookups ONCE, then computes features per complaint —
+    avoids the O(complaints x all_accounts) blowup of calling the
+    whole-table aggregation functions inside the loop."""
+    accounts_indexed = accounts.set_index("account_id")
+    txn_by_from = {acct: g for acct, g in transactions.groupby("from_account")}
+    txn_by_to = {acct: g for acct, g in transactions.groupby("to_account")}
+    wd_with_locations = withdrawals.merge(locations, on="location_id", how="left")
+    wd_by_account = {acct: g for acct, g in wd_with_locations.groupby("account_id")}
+
+    rows = [
+        point_in_time_features_for_complaint(
+            row, accounts_indexed, txn_by_from, txn_by_to, wd_by_account, graph, max_hops
+        )
+        for _, row in complaints_df.iterrows()
+    ]
+    return pd.DataFrame(rows)
+
+
+# ---------------------------------------------------------------------------
+# GROUND TRUTH TARGETS — post-event labels ONLY. Never join these into
+# model input features.
+# ---------------------------------------------------------------------------
+
+def build_ground_truth_targets(complaints, accounts, transactions, withdrawals, locations):
+    """
+    true_cashout_account is the actual thing the fund-flow model predicts
+    (evaluated via top-k / rank-of-true-account — see evaluation.py — not
+    as a simple classification label). victim_to_cashout_hops and the
+    cashout lat/lon/city are computed using the FULL, final transaction
+    graph — legitimate for evaluation/analysis since the case has already
+    resolved by the time you're scoring it, but never legitimate as a
+    model input feature.
+    """
     w = withdrawals.merge(locations, on="location_id", how="left")
-    c = complaints.merge(
-        w[["event_id", "latitude", "longitude", "city"]],
-        left_on="true_withdrawal_event",
-        right_on="event_id",
-        how="left",
-    ).rename(columns={"latitude": "cashout_lat", "longitude": "cashout_lon", "city": "cashout_city"})
-    return c[["complaint_id", "cashout_lat", "cashout_lon", "cashout_city"]]
+    targets = complaints.merge(
+        w[["event_id", "timestamp", "latitude", "longitude", "city"]],
+        left_on="true_withdrawal_event", right_on="event_id", how="left",
+    ).rename(columns={
+        "timestamp": "withdrawal_timestamp", "latitude": "cashout_lat",
+        "longitude": "cashout_lon", "city": "cashout_city",
+    })
+    targets["hours_to_withdrawal"] = (
+        targets["withdrawal_timestamp"] - targets["filed_timestamp"]
+    ).dt.total_seconds() / 3600
 
-
-# ---------------------------------------------------------------------------
-# 4. PREDICTION TARGETS
-# ---------------------------------------------------------------------------
-def build_targets(complaints: pd.DataFrame) -> pd.DataFrame:
-    """
-    Two modeling targets:
-      - classification target: is_predictive_case (already labeled)
-      - regression target: hours_to_withdrawal (time budget to intervene)
-
-    NOTE: true_cashout_account is included here because it's needed downstream
-    for joins/analysis, but it is a POST-EVENT OUTCOME (the answer ML-1/ML-2
-    are trying to predict) and must be excluded from model input features --
-    see the leakage_cols handling in main().
-    """
-    t = complaints[["complaint_id", "is_predictive_case", "victim_account", "true_cashout_account"]].copy()
-    return t
-
-
-# ---------------------------------------------------------------------------
-# COMPLAINT-LEVEL HOP DISTANCE
-# ---------------------------------------------------------------------------
-def compute_all_hops(complaints: pd.DataFrame, transactions: pd.DataFrame) -> pd.DataFrame:
-    """Calculates graph hop distances for each complaint using hops_to_cashout."""
-    G = nx.from_pandas_edgelist(
+    full_graph = nx.from_pandas_edgelist(
         transactions, "from_account", "to_account", create_using=nx.DiGraph
     )
 
     def get_hops(row):
-        v = row.get("victim_account")
-        c = row.get("true_cashout_account")
+        v, c = row["victim_account"], row["true_cashout_account"]
         if pd.isna(v) or pd.isna(c):
             return -1
         try:
-            return nx.shortest_path_length(G, source=v, target=c)
+            return nx.shortest_path_length(full_graph, source=v, target=c)
         except (nx.NetworkXNoPath, nx.NodeNotFound):
             return -1
 
-    hops_df = complaints[["complaint_id", "victim_account", "true_cashout_account"]].copy()
-    hops_df["victim_to_cashout_hops"] = hops_df.apply(get_hops, axis=1)
-    return hops_df[["complaint_id", "victim_to_cashout_hops"]]
+    targets["victim_to_cashout_hops"] = targets.apply(get_hops, axis=1)
 
-
-# ---------------------------------------------------------------------------
-# MAIN PIPELINE
-# ---------------------------------------------------------------------------
-def main():
-    accounts, transactions, withdrawals, complaints, locations = load_data()
-
-    print("Building fund flow features...")
-    fund_flow = build_fund_flow_features(accounts, transactions)
-
-    print("Building temporal features...")
-    temporal = build_temporal_features(accounts, transactions)
-    complaint_timing = build_complaint_timing_features(complaints, withdrawals)
-
-    print("Building geospatial features...")
-    geo = build_geospatial_features(withdrawals, locations)
-    cashout_geo = cashout_distance_from_victim(complaints, accounts, withdrawals, locations)
-
-    print("Building prediction targets...")
-    targets = build_targets(complaints)
-
-    # --- Assemble account-level feature table (descriptive; fine as-is) ---
-    account_features = (
-        fund_flow.merge(temporal, on="account_id", how="left")
-        .merge(geo, on="account_id", how="left")
-    )
-
-    # --- Assemble complaint-level feature table (full, includes leaky columns for now) ---
-    complaint_features = (
-        targets.merge(complaint_timing, on="complaint_id", how="left")
-        .merge(cashout_geo, on="complaint_id", how="left")
-        .merge(
-            fund_flow.add_prefix("victim_"),
-            left_on="victim_account",
-            right_on="victim_account_id",
-            how="left",
-        )
-    )
-
-    account_out = OUT_DIR / "account_features.csv"
-    complaint_out = OUT_DIR / "complaint_features.csv"
-    account_features.to_csv(account_out, index=False)
-    complaint_features.to_csv(complaint_out, index=False)
-
-    print(f"\nSaved {len(account_features)} account rows -> {account_out}")
-    print(f"Saved {len(complaint_features)} complaint rows -> {complaint_out}")
-    print(f"\nAccount feature columns:\n{list(account_features.columns)}")
-    print(f"\nComplaint feature columns:\n{list(complaint_features.columns)}")
-
-    # -----------------------------------------------------------------------
-    # HOPS FEATURE + LEAKAGE-FREE INFERENCE / TARGETS SPLIT
-    # -----------------------------------------------------------------------
-    print("\nRunning additions (hops calculation & clean feature-target split)...")
-    hops_data = compute_all_hops(complaints, transactions)
-    complaint_features_extended = complaint_features.merge(hops_data, on="complaint_id", how="left")
-
-    # Columns that must NEVER be used as ML-1/ML-2 model input, because they are only
-    # knowable after the fraud has resolved:
-    #   - true_cashout_account: the literal answer being predicted
-    #   - hours_to_withdrawal / cashout_lat / cashout_lon / cashout_city: depend on the
-    #     withdrawal event, which hasn't happened yet at prediction time
-    #   - victim_to_cashout_hops: computed FROM true_cashout_account, so it's leakage too
-    leakage_cols = [
-        "true_cashout_account",
-        "hours_to_withdrawal",
-        "cashout_lat",
-        "cashout_lon",
-        "cashout_city",
+    result = targets[[
+        "complaint_id", "is_predictive_case", "victim_account",
+        "true_cashout_account", "true_withdrawal_event",
+        "hours_to_withdrawal", "cashout_lat", "cashout_lon", "cashout_city",
         "victim_to_cashout_hops",
-    ]
-    target_cols = ["complaint_id", "is_predictive_case"] + leakage_cols
+    ]]
 
-    # The victim_* fund-flow columns merged in above are aggregated over ALL transactions
-    # (see build_fund_flow_features docstring) -- not point-in-time, so also not safe as
-    # ML-1 input. Drop them here; use point_in_time_fund_flow_features.csv from
-    # split_and_leakage_check.py for the leakage-safe replacement instead.
-    leaky_fundflow_cols = [
-        c for c in complaint_features_extended.columns
-        if c.startswith("victim_") and c != "victim_account"
-    ]
-
-    drop_cols = leakage_cols + leaky_fundflow_cols
-    clean_features = complaint_features_extended.drop(
-        columns=[c for c in drop_cols if c in complaint_features_extended.columns]
+    assert_no_suffix_collision(
+        result, expected_cols=["is_predictive_case", "true_cashout_account"],
+        context="build_ground_truth_targets merge",
     )
-    ground_truth_targets = complaint_features_extended[
-        [c for c in target_cols if c in complaint_features_extended.columns]
-    ]
+    return result
 
-    clean_features_out = OUT_DIR / "complaint_features_inference_clean.csv"
-    targets_out = OUT_DIR / "complaint_ground_truth_targets.csv"
 
-    clean_features.to_csv(clean_features_out, index=False)
-    ground_truth_targets.to_csv(targets_out, index=False)
-
-    print(f"Saved clean inference features ({clean_features.shape[1]} cols) -> {clean_features_out}")
-    print(f"Saved ground truth targets/post-event labels ({ground_truth_targets.shape[1]} cols) -> {targets_out}")
-    print(
-        "\nReminder: join point_in_time_fund_flow_features.csv "
-        "(from split_and_leakage_check.py) onto complaint_features_inference_clean.csv "
-        "before training ML-1 -- that's where the leakage-safe fund-flow features live."
+def build_account_features_full_history(accounts, transactions, withdrawals, locations):
+    """Descriptive, whole-dataset account features — useful for EDA/dashboards.
+    NEVER use as ML model input; every row here is aggregated over the
+    ENTIRE dataset, including events that happen after any given complaint."""
+    fund_flow = build_fund_flow_features(accounts, transactions)
+    temporal = build_temporal_features(accounts, transactions)
+    geo = build_geospatial_features(withdrawals, locations)
+    return fund_flow.merge(temporal, on="account_id", how="left").merge(
+        geo, on="account_id", how="left"
     )
 
 
 if __name__ == "__main__":
-    main()
+    from time_split import time_based_split
+
+    accounts, transactions, withdrawals, complaints, locations = load_data()
+    graph = build_transaction_graph({
+        "accounts": accounts, "transactions": transactions,
+    })
+
+    print("Building full-history account features (descriptive only)...")
+    account_features = build_account_features_full_history(
+        accounts, transactions, withdrawals, locations
+    )
+    account_features.to_csv(OUT_DIR / "account_features_full_history.csv", index=False)
+    print(f"  -> {len(account_features)} accounts")
+
+    print("\nBuilding point-in-time (leakage-safe) complaint features...")
+    predictive = complaints[complaints["is_predictive_case"]]
+    complaint_features = build_complaint_feature_matrix(
+        predictive, accounts, transactions, withdrawals, locations, graph
+    )
+    complaint_features.to_csv(OUT_DIR / "complaint_features_pointintime.csv", index=False)
+    print(f"  -> {complaint_features.shape[0]} complaints, {complaint_features.shape[1]} features")
+
+    print("\nBuilding ground truth targets (labels only, never model input)...")
+    targets = build_ground_truth_targets(complaints, accounts, transactions, withdrawals, locations)
+    targets.to_csv(OUT_DIR / "complaint_ground_truth_targets.csv", index=False)
+    print(f"  -> {len(targets)} rows")
+
+    print("\nColumns in ML-ready complaint_features_pointintime.csv:")
+    print(list(complaint_features.columns))
