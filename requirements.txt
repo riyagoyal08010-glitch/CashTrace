@@ -3,6 +3,7 @@
 # ============================================================
 
 # ---- Data pipeline & synthetic data generation ----
+Python: 3.10.6
 pandas==2.2.2
 numpy==1.26.4
 Faker==40.38.0
