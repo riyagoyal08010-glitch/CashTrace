@@ -1,6 +1,6 @@
 from fastapi import FastAPI
 
-from app.routers import (accounts, transactions, complaints, locations, withdrawal_events, predictions)
+from app.routers import (accounts, transactions, complaints, locations, withdrawal_events, predictions,risk)
 
 
 app = FastAPI(
@@ -15,7 +15,7 @@ app.include_router(complaints.router)
 app.include_router(locations.router)
 app.include_router(withdrawal_events.router)
 app.include_router(predictions.router)
-
+app.include_router(risk.router)
 
 @app.get("/")
 def root():
