@@ -38,7 +38,7 @@ export function ThreatFeed({ events, selectedId, onSelect, isLive, onToggleLive 
           <h2 className="truncate text-sm font-bold uppercase tracking-wider text-slate-300">Real-Time Threat Feed</h2>
         </div>
         <span className="shrink-0 rounded-full bg-red-500/20 px-2 py-0.5 text-[10px] font-bold text-red-400">
-          Risk &gt; 0.85
+          Backend Signals
         </span>
 
         <button

@@ -1,48 +1,77 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useEffect, useState } from 'react';
 import type { ThreatEvent } from '@/lib/types';
-import { generateInitialEvents, generateThreatEvent } from '@/lib/mockData';
 
-const MAX_EVENTS = 200;
-const TICK_INTERVAL = 4000;
+const API_URL = 'http://127.0.0.1:8000';
 
 export function useThreatFeed() {
-  const [events, setEvents] = useState<ThreatEvent[]>(() => generateInitialEvents(40));
+  const [events, setEvents] = useState<ThreatEvent[]>([]);
   const [liveCount, setLiveCount] = useState(0);
   const [isLive, setIsLive] = useState(true);
-  const tickRef = useRef<ReturnType<typeof setInterval> | null>(null);
-
-  const tick = useCallback(() => {
-    setEvents((prev) => {
-      const newEvent = generateThreatEvent();
-      const next = [newEvent, ...prev];
-      if (next.length > MAX_EVENTS) next.length = MAX_EVENTS;
-      return next;
-    });
-    setLiveCount((c) => c + 1);
-  }, []);
 
   useEffect(() => {
-    if (!isLive) {
-      if (tickRef.current) clearInterval(tickRef.current);
-      return;
-    }
-    tickRef.current = setInterval(tick, TICK_INTERVAL);
-    return () => {
-      if (tickRef.current) clearInterval(tickRef.current);
-    };
-  }, [isLive, tick]);
+    const fetchEvents = async () => {
+      try {
+        const response = await fetch(`${API_URL}/risk/withdrawals`);
 
-  const simulateFraudEvent = useCallback(() => {
-    const burst = 5;
-    setEvents((prev) => {
-      const newEvents: ThreatEvent[] = [];
-      for (let i = 0; i < burst; i++) {
-        newEvents.push(generateThreatEvent(true));
+        if (!response.ok) {
+          throw new Error(`API error: ${response.status}`);
+        }
+
+        const data = await response.json();
+
+        console.log('Backend data:', data);
+
+        const mappedEvents: ThreatEvent[] = data.results.map((item: any) => ({
+          id: item.withdrawal_id,
+        city: item.city ?? 'Unknown',
+          state: 'India',
+          lat: item.latitude,
+          lng: item.longitude,
+          riskScore: item.risk_score > 1 ? item.risk_score / 100 : item.risk_score,
+          category: 'ATM Fraud',
+          amount: item.amount,
+          timestamp: new Date(item.timestamp).getTime(),
+          description: `Cash withdrawal detected at ${item.location_name ?? 'unknown location'}`,
+          status: (item.risk_score > 1 ? item.risk_score / 100 : item.risk_score) >= 0.85
+  ? 'flagged'
+  : 'investigating',
+
+          bankDetails: {
+            name: 'Bank information unavailable',
+            branch: 'N/A',
+            lat: item.latitude,
+            lng: item.longitude,
+          },
+
+          nearestPoliceStation: {
+            name: 'Cyber Crime Police Station',
+            jurisdiction: 'Local Jurisdiction',
+            distanceKm: 0,
+            lat: item.latitude,
+            lng: item.longitude,
+            phone: '112',
+          },
+        }));
+
+        setEvents(mappedEvents);
+        setLiveCount(mappedEvents.length);
+      } catch (error) {
+        console.error('Failed to fetch backend data:', error);
       }
-      return [...newEvents, ...prev].slice(0, MAX_EVENTS);
-    });
-    setLiveCount((c) => c + burst);
+    };
+
+    fetchEvents();
   }, []);
 
-  return { events, liveCount, isLive, setIsLive, simulateFraudEvent };
+  const simulateFraudEvent = () => {
+    console.log('ML/fraud simulation will be connected later.');
+  };
+
+  return {
+    events,
+    liveCount,
+    isLive,
+    setIsLive,
+    simulateFraudEvent,
+  };
 }

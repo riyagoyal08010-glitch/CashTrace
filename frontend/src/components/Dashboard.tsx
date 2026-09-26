@@ -30,10 +30,10 @@ export function Dashboard() {
     });
   }, [events, filters]);
 
-  const highRiskEvents = useMemo(
-    () => filteredEvents.filter((e) => e.riskScore > 0.85),
-    [filteredEvents]
-  );
+const highRiskEvents = useMemo(
+  () => filteredEvents,
+  [filteredEvents]
+);
 
   const criticalCount = useMemo(
     () => events.filter((e) => e.riskScore >= 0.9).length,

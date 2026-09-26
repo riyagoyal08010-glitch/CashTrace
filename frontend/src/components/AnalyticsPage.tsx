@@ -190,7 +190,7 @@ function TimeSeriesChart({ data }: { data: ReturnType<typeof computeTimeSeries> 
 
   return (
     <div>
-      <h3 className="mb-4 text-sm font-bold text-white">Events Over Time (Last 60 min)</h3>
+      <h3 className="mb-4 text-sm font-bold text-white">Events Over Time</h3>
       <ResponsiveContainer width="100%" height={340}>
         <AreaChart data={data}>
           <defs>
