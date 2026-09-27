@@ -1,7 +1,17 @@
+import os
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.routers import (accounts, transactions, complaints, locations, withdrawal_events, predictions,risk)
+from app.routers import (
+    accounts,
+    transactions,
+    complaints,
+    locations,
+    withdrawal_events,
+    predictions,
+    risk,
+)
 from app.database import Base, engine
 from app import models
 
@@ -11,16 +21,20 @@ app = FastAPI(
     version="1.0.0"
 )
 
+FRONTEND_URL = os.getenv(
+    "FRONTEND_URL",
+    "http://localhost:5173"
+)
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173"],
+    allow_origins=[FRONTEND_URL],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 Base.metadata.create_all(bind=engine)
-
 
 app.include_router(accounts.router)
 app.include_router(transactions.router)
@@ -29,6 +43,7 @@ app.include_router(locations.router)
 app.include_router(withdrawal_events.router)
 app.include_router(predictions.router)
 app.include_router(risk.router)
+
 
 @app.get("/")
 def root():
