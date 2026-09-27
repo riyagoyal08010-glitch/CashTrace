@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react';
 import type { ThreatEvent } from '@/lib/types';
 
-const API_URL = 'http://127.0.0.1:8000';
+const API_URL = import.meta.env.VITE_API_URL;
 
 export function useThreatFeed() {
   const [events, setEvents] = useState<ThreatEvent[]>([]);
