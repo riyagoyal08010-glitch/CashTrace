@@ -597,4 +597,4 @@ This discipline should continue for the fund-flow and geo-time models: report ac
 
 ---
 
-*This document is maintained alongside the codebase at `docs/TECHNICAL_DOCUMENTATION.md`. It should be updated whenever a described component's behavior changes materially.*
+
